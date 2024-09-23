@@ -25,8 +25,8 @@ RATIOS = [0.05, 0.25]
 
 # Model configs
 MODELS = {'llama': 'meta-llama/Llama-2-7b-chat-hf'}
-BATCH_PROMPT = [(1, 1024), (1, 2048), (1, 4096), (1, 7986), (1, 8096), (4, 1024), (4, 2048), (4, 4096)]
-output_length = 64
+BATCH_PROMPT = [(1, 256), (4, 256), (8, 256), (16, 256), (32, 256), (64, 256), (128, 256), (256, 256)]
+output_length = 128
 num_repeats = 20
 num_warmups = 15
 
@@ -66,38 +66,37 @@ metrics_list = []
 for model_name in MODELS:
     set_seed(42)
     model_name_or_path = MODELS[model_name]
+    config = LlamaConfig.from_pretrained(model_name_or_path)
 
+    tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path, 
+            use_fast=False, 
+            trust_remote_code=True, 
+        )
+    
     for ratio in RATIOS:
-        config = LlamaConfig.from_pretrained(model_name_or_path)
+        config.heavy_ratio = ratio
+        config.recent_ratio = ratio
+
+        model = ENABLE_Heavy_Hitter_FUNCTIONS["llama"].from_pretrained(
+            pretrained_model_name_or_path=model_name_or_path,
+            config=config,
+            cache_dir=CACHE_DIR,
+            torch_dtype=torch.float16,
+        )
+
+        model.half().eval().cuda()
+        
+        # warmup LLM
+        print(f"[INFO] Warming up {num_warmups} times for {model_name_or_path}[h_ratio={ratio},r_ratio={ratio}].")
+        string = 'this is a random prompt that we want our LLM to use during warmup. This will be repeated multiple times. this is a random prompt that we want our LLM to use during warmup. This will be repeated multiple times.'
+        inputs = tokenizer(string, return_tensors="pt").to('cuda')
+        input_ids = inputs['input_ids']
+        with torch.no_grad():
+            for i in range(num_warmups):
+                outputs = model.generate(**inputs, max_new_tokens=output_length)
 
         for batch_size, prompt_length in BATCH_PROMPT:
-            config.heavy_ratio = ratio
-            config.recent_ratio = ratio
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_name_or_path, 
-                use_fast=False, 
-                trust_remote_code=True, 
-            )
-
-            model = ENABLE_Heavy_Hitter_FUNCTIONS["llama"].from_pretrained(
-                pretrained_model_name_or_path=model_name_or_path,
-                config=config,
-                cache_dir=CACHE_DIR,
-                torch_dtype=torch.float16,
-            )
-
-            model.half().eval().cuda()
-
-            # warmup LLM
-            print(f"[INFO] Warming up {num_warmups} times for {model_name_or_path}[h_ratio={ratio},r_ratio={ratio}].")
-            string = 'this is a random prompt that we want our LLM to use during warmup. This will be repeated multiple times. this is a random prompt that we want our LLM to use during warmup. This will be repeated multiple times.'
-            inputs = tokenizer(string, return_tensors="pt").to('cuda')
-            input_ids = inputs['input_ids']
-            with torch.no_grad():
-                for i in range(num_warmups):
-                    outputs = model.generate(**inputs, max_new_tokens=output_length)
-
             context = []
             for _ in range(batch_size):
                 string = 't,' * (prompt_length // 2)
@@ -163,4 +162,4 @@ for model_name in MODELS:
                 })
 
 metrics = pd.DataFrame(metrics_list)
-metrics.to_csv("H2O-metrics.csv", index=False)
+metrics.to_csv("h2o-large-batch-metrics.csv", index=False)
