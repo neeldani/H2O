@@ -6,25 +6,32 @@
 
 - PyTorch >= 1.12
 
-```
-pip install crfm-helm
-pip install git+https://github.com/huggingface/transformers
-pip install lm-eval
-```
+## H2O + MiniKV
 
+### Setup
 
 ```
-# modify the original toxicity_metrics.py
-import helm
-import os, shutil
-install_path = helm.__file__
-source_path = 'helm/src/helm/benchmark/metrics/toxicity_metrics.py'
-target_path = '/'.join(install_path.split('/')[:-1])
-target_path = os.path.join(target_path, 'benchmark/metrics/toxicity_metrics.py')
-shutil.copy(source_path, target_path)
+git clone https://github.com/neeldani/H2O.git
+cd H2O
+git checkout feature/batching
+cd h2o_hf
+conda env create -f environment.yml
+
+# build transformers from source
+cd transformers-4.35.2
+pip install -e . -U
+
+# build flash attention from source
+git clone https://github.com/jpli02/flash-attention/tree/main
+cd flash-attention
+git checkout accum
+pip install . --no-build-isolation -v
 ```
 
+### How to run
+We will be using the code inside `h2o_hf`. The main parts of H2O are defined in the `h2o_hf/utils_real_drop/modify_llama.py` file. Use the branch `feature/batching`. 
 
+`h2o_hf/mem_spd_test.py` is the file that we use for benchmarking H2O. Modify `h2o_batch_0.05.slurm` file and run it as an example.
 
 ## Usage and Examples
 
