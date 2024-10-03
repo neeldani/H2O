@@ -8,6 +8,10 @@ import torch.utils.checkpoint
 
 import torch.nn.functional as F
 
+from flash_attn import (
+    flash_attn_func,
+)
+
 # from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -190,19 +194,6 @@ class LlamaConfig(PretrainedConfig):
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -277,21 +268,21 @@ class H2OKVCache_LayerWise:
         _, keep_topk = torch.topk(select_hh_scores, self.hh_size, dim=-1)
         keep_topk = keep_topk.sort().values
 
-        # keep_recent = torch.arange(seq_len - self.recent_size, seq_len).expand(keep_topk.shape[0], 1).to(keep_topk.device)
         keep_recent = torch.arange(seq_len - self.recent_size, seq_len, device=keep_topk.device).repeat(keep_topk.shape[0], keep_topk.shape[1], 1)
         keep_idx = torch.cat([keep_topk, keep_recent], dim=-1)
 
+        print("HH score shape", self.hh_score.shape)
         mask = torch.zeros(self.hh_score.shape, dtype=torch.bool).to(past_key_values[0].device)
         mask = mask.scatter(-1, keep_idx, 1)
 
+        print("Past key/value shape:", past_key_values[0].shape)
+        print("Mask shape", mask.shape)
         k_hh_recent = past_key_values[0][mask].view(bsz, num_heads, -1, head_dim)
         v_hh_recent = past_key_values[1][mask].view(bsz, num_heads, -1, head_dim)
 
         self.hh_score = self.hh_score[mask].view(bsz, num_heads, self.cache_size)
 
         return (k_hh_recent, v_hh_recent)
-
-    def evict_for_space(self, past_key_values, num_coming):
         if past_key_values is None:
             return None
         seq_len = past_key_values[0][0].size(self.k_seq_dim)
@@ -321,6 +312,7 @@ class H2OKVCache_LayerWise:
 
     def _update_hh_score(self, attn_score_cache):
         # attn_score_cache shape: (bsz, num_heads, num_seq, head_dim)
+        print("Before summing scores shape", attn_score_cache.shape)
         num_new_tokens = attn_score_cache.shape[2]
 
         if self.hh_score is None:
@@ -329,6 +321,8 @@ class H2OKVCache_LayerWise:
             attn_score_cache = attn_score_cache.sum(2)
             attn_score_cache[:, :, :-num_new_tokens] += self.hh_score
             self.hh_score = attn_score_cache
+        
+        print("After summing scores shape", self.hh_score.shape)
 
     def _clean_scores(self):
         self.hh_score = None
@@ -446,15 +440,6 @@ class H2OLlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        # remake causal mask
-        attention_mask = _make_causal_mask(
-            bsz=bsz,
-            tgt_len=q_len,
-            past_key_values_length=past_key_value[0].shape[-2] if past_key_value is not None else 0,
-            dtype=query_states.dtype,
-            device=query_states.device,
-        )
-
         kv_seq_len = key_states.shape[-2] # q_len
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -493,31 +478,69 @@ class H2OLlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups) # bsz, num_heads, q_len, head_dim
         value_states = repeat_kv(value_states, self.num_key_value_groups) # bsz, num_heads, q_len, head_dim
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim
-        ) # (bsz, num_heads, q_len, kv_seq_len)
+        if not self.config.use_flash:
+            print("Not using flash")
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
+                self.head_dim
+            ) # (bsz, num_heads, q_len, kv_seq_len)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
+            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                    f" {attn_weights.size()}"
+                )
+            
+            attention_mask = _make_causal_mask(
+                bsz=bsz,
+                tgt_len=q_len,
+                past_key_values_length=past_key_value[0].shape[-2] if past_key_value is not None else 0,
+                dtype=query_states.dtype,
+                device=query_states.device,
             )
 
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask # (bsz, num_heads, q_len, kv_seq_len)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+                    raise ValueError(
+                        f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                        f" {attn_weights.size()}"
+                    )
+                attn_weights = attn_weights + attention_mask # (bsz, num_heads, q_len, kv_seq_len)
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
-        ) # (bsz, num_heads, q_len, kv_seq_len)
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+                query_states.dtype
+            ) # (bsz, num_heads, q_len, kv_seq_len)
+
+            attn_output = torch.matmul(attn_weights, value_states)
+
+        else:
+            print("Using flash")
+            print("Query state", query_states.shape)
+            print("Key state", key_states.shape)
+            print("Value state", value_states.shape)
+            attn_output, attn_weights = flash_attn_func(
+                        query_states.permute(0, 2, 1, 3),
+                        key_states.permute(0, 2, 1, 3),
+                        value_states.permute(0, 2, 1, 3),
+                        dropout_p = 1e-8,
+                        causal=True,
+                        window_size=(-1,-1),
+                        alibi_slopes=None,
+                        deterministic=False,
+                        return_attn_probs=False,
+                    )
+
+            attn_output = attn_output.permute(0, 2, 1, 3)
+            print("Fresh attention output shape: ", attn_output.shape)
+            print("Fresh attention weights shape: ", attn_weights.shape)
+
+            # if attn_weights.size() != (bsz, self.num_heads, 128, kv_seq_len):
+            #         raise ValueError(
+            #             f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+            #             f" {attn_weights.size()}"
+            #         )
 
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
-
-        attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
